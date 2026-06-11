@@ -2,16 +2,20 @@
 #include <blola/directWrite_SEGGER_RTT.hpp>
 
 #include <array>
-#include <cstddef>
 #include <cstdint>
-#include <optional>
 
-#include "Finally.hpp"
 #include "usbd_cdc_if.h"
 #include "usbd_def.h"
 
 extern USBD_HandleTypeDef hUsbDeviceFS;
 extern TIM_HandleTypeDef htim2;
+
+bool run = false;
+
+uint32_t readCount = 0;
+uint32_t delayCount = 0;
+
+uint8_t samples[] = {1, 2, 3, 4};
 
 enum class CommandShort {
   Reset = 0x00,
@@ -87,7 +91,7 @@ bool isLongCommand(uint8_t commandCode) {
 auto idLine = std::to_array<std::uint8_t>({'1', 'A', 'L', 'S'});
 
 auto metadata = std::to_array<std::uint8_t>({
-    // 1. Name: "STM32\0"
+    // 1. Name
     0x01,
     'S',
     'T',
@@ -108,7 +112,6 @@ auto metadata = std::to_array<std::uint8_t>({
     '8',
     '2',
     '1',
-    '!',
     0x00,
 
     // 2. Channels: 8 (0x00000008)
@@ -144,7 +147,6 @@ auto metadata = std::to_array<std::uint8_t>({
 });
 
 void onShortCommand(CommandShort command) {
-  blog("Short command: 0x%02hhX", static_cast<uint8_t>(command));
   switch (command) {
   case CommandShort::ID:
     blog("Send ID \"1ALS\"");
@@ -155,9 +157,14 @@ void onShortCommand(CommandShort command) {
     CDC_Transmit_FS(metadata.data(), metadata.size());
     break;
   case CommandShort::Reset:
+    run = false;
+    break;
   case CommandShort::Run:
+    run = true;
+    break;
   case CommandShort::XON:
   case CommandShort::XOFF:
+    blog("Short command: 0x%02hhX", static_cast<uint8_t>(command));
     break;
   }
 }
@@ -180,11 +187,17 @@ void onLongCommand(CommandLong command, uint32_t arg) {
   case CommandLong::SetTriggerConfigurationStage2:
   case CommandLong::SetTriggerConfigurationStage3:
   case CommandLong::SetTriggerConfigurationStage4:
+    blog("Triggers not supported (ignored)");
+    break;
   case CommandLong::SetDivider:
+    break;
   case CommandLong::SetReadAndDelayCount:
+    readCount = (arg & 0xFFFF) << 2;
+    delayCount = (arg >> 16 & 0xFFFF) << 2;
+    blog("Set delay: %u read: %u", delayCount, readCount);
     break;
   case CommandLong::SetFlags:
-    blog("Set flags not supported (ignored)");
+    blog("Flags not supported (ignored)");
     break;
   }
 }
@@ -249,6 +262,15 @@ extern "C" int cpp_main() {
   blinkSignal(2);
 
   while (true) {
+    if (run) {
+      blog("Reporting...");
+      for (uint32_t i = 0; i < readCount; i += sizeof(samples)) {
+        while (CDC_Transmit_FS(samples, sizeof(samples)) == USBD_BUSY)
+          ;
+      }
+      blog("Reported!");
+      run = false;
+    }
     if (usbBuf) {
       auto buf = usbBuf;
       auto len = usbBufLen;

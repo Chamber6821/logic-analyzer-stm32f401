@@ -1,0 +1,268 @@
+#include <blola/blola.hpp>
+#include <blola/directWrite_SEGGER_RTT.hpp>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+
+#include "Finally.hpp"
+#include "usbd_cdc_if.h"
+#include "usbd_def.h"
+
+extern USBD_HandleTypeDef hUsbDeviceFS;
+extern TIM_HandleTypeDef htim2;
+
+enum class CommandShort {
+  Reset = 0x00,
+  Run = 0x01,
+  ID = 0x02,
+  GetMeatadata = 0x04,
+  XON = 0x11,
+  XOFF = 0x13,
+};
+
+enum class CommandLong {
+  SetTriggerMaskStage0 = 0xC0,
+  SetTriggerMaskStage1 = 0xC4,
+  SetTriggerMaskStage2 = 0xC8,
+  SetTriggerMaskStage3 = 0xCC,
+  SetTriggerMaskStage4 = 0xD0,
+
+  SetTriggerValuesStage0 = 0xC1,
+  SetTriggerValuesStage1 = 0xC5,
+  SetTriggerValuesStage2 = 0xC9,
+  SetTriggerValuesStage3 = 0xCD,
+  SetTriggerValuesStage4 = 0xD1,
+
+  SetTriggerConfigurationStage0 = 0xC2,
+  SetTriggerConfigurationStage1 = 0xC6,
+  SetTriggerConfigurationStage2 = 0xCA,
+  SetTriggerConfigurationStage3 = 0xCE,
+  SetTriggerConfigurationStage4 = 0xD2,
+
+  SetDivider = 0x80,
+  SetReadAndDelayCount = 0x81,
+  SetFlags = 0x82,
+};
+
+bool isShortCommand(uint8_t commandCode) {
+  switch (static_cast<CommandShort>(commandCode)) {
+  case CommandShort::Reset:
+  case CommandShort::Run:
+  case CommandShort::ID:
+  case CommandShort::GetMeatadata:
+  case CommandShort::XON:
+  case CommandShort::XOFF:
+    return true;
+  }
+  return false;
+}
+
+bool isLongCommand(uint8_t commandCode) {
+  switch (static_cast<CommandLong>(commandCode)) {
+  case CommandLong::SetDivider:
+  case CommandLong::SetReadAndDelayCount:
+  case CommandLong::SetFlags:
+  case CommandLong::SetTriggerMaskStage0:
+  case CommandLong::SetTriggerMaskStage1:
+  case CommandLong::SetTriggerMaskStage2:
+  case CommandLong::SetTriggerMaskStage3:
+  case CommandLong::SetTriggerMaskStage4:
+  case CommandLong::SetTriggerValuesStage0:
+  case CommandLong::SetTriggerValuesStage1:
+  case CommandLong::SetTriggerValuesStage2:
+  case CommandLong::SetTriggerValuesStage3:
+  case CommandLong::SetTriggerValuesStage4:
+  case CommandLong::SetTriggerConfigurationStage0:
+  case CommandLong::SetTriggerConfigurationStage1:
+  case CommandLong::SetTriggerConfigurationStage2:
+  case CommandLong::SetTriggerConfigurationStage3:
+  case CommandLong::SetTriggerConfigurationStage4:
+    return true;
+  }
+  return false;
+}
+
+auto idLine = std::to_array<std::uint8_t>({'1', 'A', 'L', 'S'});
+
+auto metadata = std::to_array<std::uint8_t>({
+    // 1. Name: "STM32\0"
+    0x01,
+    'S',
+    'T',
+    'M',
+    '3',
+    '2',
+    ' ',
+    'L',
+    'A',
+    ' ',
+    'C',
+    'a',
+    'm',
+    'b',
+    'e',
+    'r',
+    '6',
+    '8',
+    '2',
+    '1',
+    '!',
+    0x00,
+
+    // 2. Channels: 8 (0x00000008)
+    0x20,
+    0x00,
+    0x00,
+    0x00,
+    0x08,
+
+    // 3. Sample memory: 55 * 1024 = 56320 (0x0000DC00)
+    0x21,
+    0x00,
+    0x00,
+    0xDC,
+    0x00,
+
+    // 4. Max sample rate: 42 000 000 = 0x0280DE80
+    0x23,
+    0x02,
+    0x80,
+    0xDE,
+    0x80,
+
+    // 5. SUMP protocol version: 2 (0x00000002)
+    0x24,
+    0x00,
+    0x00,
+    0x00,
+    0x02,
+
+    // Терминатор метаданных
+    0x00,
+});
+
+void onShortCommand(CommandShort command) {
+  blog("Short command: 0x%02hhX", static_cast<uint8_t>(command));
+  switch (command) {
+  case CommandShort::ID:
+    blog("Send ID \"1ALS\"");
+    CDC_Transmit_FS(idLine.data(), idLine.size());
+    break;
+  case CommandShort::GetMeatadata:
+    blog("Send Metadata");
+    CDC_Transmit_FS(metadata.data(), metadata.size());
+    break;
+  case CommandShort::Reset:
+  case CommandShort::Run:
+  case CommandShort::XON:
+  case CommandShort::XOFF:
+    break;
+  }
+}
+
+void onLongCommand(CommandLong command, uint32_t arg) {
+  blog("Long command: 0x%02hhX 0x%08X", static_cast<uint8_t>(command), arg);
+  switch (command) {
+  case CommandLong::SetTriggerMaskStage0:
+  case CommandLong::SetTriggerMaskStage1:
+  case CommandLong::SetTriggerMaskStage2:
+  case CommandLong::SetTriggerMaskStage3:
+  case CommandLong::SetTriggerMaskStage4:
+  case CommandLong::SetTriggerValuesStage0:
+  case CommandLong::SetTriggerValuesStage1:
+  case CommandLong::SetTriggerValuesStage2:
+  case CommandLong::SetTriggerValuesStage3:
+  case CommandLong::SetTriggerValuesStage4:
+  case CommandLong::SetTriggerConfigurationStage0:
+  case CommandLong::SetTriggerConfigurationStage1:
+  case CommandLong::SetTriggerConfigurationStage2:
+  case CommandLong::SetTriggerConfigurationStage3:
+  case CommandLong::SetTriggerConfigurationStage4:
+  case CommandLong::SetDivider:
+  case CommandLong::SetReadAndDelayCount:
+    break;
+  case CommandLong::SetFlags:
+    blog("Set flags not supported (ignored)");
+    break;
+  }
+}
+
+class CommandReader {
+  enum { COMMAND, BYTE1, BYTE2, BYTE3, BYTE4 } expectation = COMMAND;
+  CommandLong command;
+  uint32_t arg;
+
+public:
+  void putByte(uint8_t byte) {
+    switch (expectation) {
+    case COMMAND:
+      if (isShortCommand(byte)) {
+        onShortCommand(static_cast<CommandShort>(byte));
+      } else if (isLongCommand(byte)) {
+        command = static_cast<CommandLong>(byte);
+        expectation = BYTE1;
+      } else {
+        blog("Unknown command: 0x%02hhX", byte);
+      }
+      break;
+    case BYTE1:
+      expectation = BYTE2;
+      arg = byte;
+      break;
+    case BYTE2:
+      expectation = BYTE3;
+      arg |= byte << 8;
+      break;
+    case BYTE3:
+      expectation = BYTE4;
+      arg |= byte << 16;
+      break;
+    case BYTE4:
+      expectation = COMMAND;
+      arg |= byte << 24;
+      onLongCommand(command, arg);
+      break;
+    }
+  }
+} commandReader;
+
+void blinkSignal(int times) {
+  SET_BIT(LED_GPIO_Port->ODR, LED_Pin);
+  for (int i = 0; i < times * 2; i++) {
+    LED_GPIO_Port->ODR ^= LED_Pin;
+    HAL_Delay(100);
+  }
+  SET_BIT(LED_GPIO_Port->ODR, LED_Pin);
+  HAL_Delay(300);
+}
+
+uint8_t *volatile usbBuf = nullptr;
+volatile uint32_t usbBufLen = 0;
+
+extern "C" int cpp_main() {
+  blog("Startup");
+
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+
+  blinkSignal(2);
+
+  while (true) {
+    if (usbBuf) {
+      auto buf = usbBuf;
+      auto len = usbBufLen;
+      for (uint32_t i = 0; i < len; i++) {
+        commandReader.putByte(buf[i]);
+      }
+      usbBuf = nullptr;
+      usbBufLen = 0;
+      USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+    }
+  }
+}
+
+extern "C" void USB_CDC_RxHandler(uint8_t *Buf, uint32_t Len) {
+  usbBuf = Buf;
+  usbBufLen = Len;
+}

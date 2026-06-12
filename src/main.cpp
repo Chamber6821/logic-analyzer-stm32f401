@@ -1,25 +1,36 @@
+#include "main.h"
+
 #include <blola/blola.hpp>
 #include <blola/directWrite_SEGGER_RTT.hpp>
 
 #include <array>
 #include <cstdint>
 
+#include "stm32f401xc.h"
+#include "stm32f4xx.h"
+#include "stm32f4xx_hal_dma.h"
+#include "stm32f4xx_hal_tim.h"
 #include "usbd_cdc_if.h"
 #include "usbd_def.h"
 
 #define METADATA_NUMBER(UINT32)                                                \
-  ((UINT32) >> 24) & 0xFF, ((UINT32) >> 16) & 0xFF, ((UINT32) >> 8) & 0xFF,    \
-      ((UINT32) >> 0) & 0xFF
+  (uint8_t)((UINT32) >> 24), (uint8_t)((UINT32) >> 16),                        \
+      (uint8_t)((UINT32) >> 8), (uint8_t)((UINT32) >> 0)
 
 extern USBD_HandleTypeDef hUsbDeviceFS;
-extern TIM_HandleTypeDef htim2;
+
+extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim3;
+extern DMA_HandleTypeDef hdma_tim1_up;
 
 bool run = false;
 
 uint32_t readCount = 0;
 uint32_t delayCount = 0;
 
-uint8_t samples[] = {1, 2, 3, 4};
+uint8_t samples[1024] = {0x12, 0x34};
+
+uint32_t sampleClock = 84'000'000;
 
 enum class CommandShort {
   Reset = 0x00,
@@ -106,7 +117,7 @@ auto metadata = std::to_array<std::uint8_t>(
      0x21, METADATA_NUMBER(sizeof(samples)),
 
      // 4. Max sample rate (Hz)
-     0x23, METADATA_NUMBER(42'000'000),
+     0x23, METADATA_NUMBER(sampleClock),
 
      // 5. SUMP protocol version
      0x24, METADATA_NUMBER(2),
@@ -222,12 +233,61 @@ void blinkSignal(int times) {
 uint8_t *volatile usbBuf = nullptr;
 volatile uint32_t usbBufLen = 0;
 
+void initMeasuring() {
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  CLEAR_BIT(TIM3->CR1, TIM_CR1_CEN);
+  HAL_DMA_Start(&hdma_tim1_up, (uint32_t)&(GPIOB->IDR), (uint32_t)samples,
+                sizeof(samples));
+  SET_BIT(TIM1->DIER, TIM_DIER_UDE);
+}
+
+void startMeasuring() {
+  TIM1->CNT = 0;
+  TIM3->CNT = 0;
+  SET_BIT(TIM1->CR1, TIM_CR1_CEN);
+}
+
+void stopMeasuring() { CLEAR_BIT(TIM1->CR1, TIM_CR1_CEN); }
+
+void trigger() { SET_BIT(TIM3->CR1, TIM_CR1_CEN); }
+
+void setDelay(uint32_t samples) {
+  samples /= DELAY_PRESCALER + 1;
+  TIM3->ARR = samples;
+  TIM3->CCR1 = samples;
+}
+
+void serDivider(uint32_t divider) {
+  // Sigrok игнорирует анонсированную частоту и всегда передает делитель для
+  // 100МГц
+  auto effectiveDevider = (divider + 1) * 84 / 100;
+  if (effectiveDevider < 0xFFFF) {
+    TIM1->PSC = 0;
+    TIM1->ARR = effectiveDevider - 1;
+  } else {
+  }
+}
+
+uint32_t lastSampleIndex() {
+  return sizeof(samples) - __HAL_DMA_GET_COUNTER(&hdma_tim1_up);
+}
+
 extern "C" int cpp_main() {
   blog("Startup");
 
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  initMeasuring();
+  setDelay(4);
+  trigger();
+  startMeasuring();
 
   blinkSignal(2);
+
+  blog("DMA Status: %hhX", (uint8_t)HAL_DMA_GetState(&hdma_tim1_up));
+
+  blog("Initial GPIO state: 0x%08X", GPIOB->IDR);
+  for (int i = 0; i < 6; i++) {
+    blog("Sample[%hhu] = 0x%02hhX", (uint8_t)i, samples[i]);
+  }
 
   while (true) {
     if (run) {

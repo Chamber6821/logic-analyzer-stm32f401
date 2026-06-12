@@ -1,4 +1,5 @@
 #include "main.h"
+#include "commands.hpp"
 
 #include <blola/blola.hpp>
 #include <blola/directWrite_SEGGER_RTT.hpp>
@@ -20,88 +21,21 @@
 extern USBD_HandleTypeDef hUsbDeviceFS;
 
 extern TIM_HandleTypeDef htim1;
+extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern DMA_HandleTypeDef hdma_tim1_up;
 
-bool run = false;
+void setDelay(uint32_t samples);
+void setRead(uint32_t samples);
+void setDivider(uint32_t divider);
 
+volatile enum { IDLE, WAIT_TRIGGER, MEASURING, REPORTING } state = IDLE;
 uint32_t readCount = 0;
-uint32_t delayCount = 0;
-
 uint8_t samples[1024] = {0x12, 0x34};
+uint32_t sampleClock = 84'000'000 / 5;
 
-uint32_t sampleClock = 84'000'000;
-
-enum class CommandShort {
-  Reset = 0x00,
-  Run = 0x01,
-  ID = 0x02,
-  GetMeatadata = 0x04,
-  XON = 0x11,
-  XOFF = 0x13,
-};
-
-enum class CommandLong {
-  SetTriggerMaskStage0 = 0xC0,
-  SetTriggerMaskStage1 = 0xC4,
-  SetTriggerMaskStage2 = 0xC8,
-  SetTriggerMaskStage3 = 0xCC,
-  SetTriggerMaskStage4 = 0xD0,
-
-  SetTriggerValuesStage0 = 0xC1,
-  SetTriggerValuesStage1 = 0xC5,
-  SetTriggerValuesStage2 = 0xC9,
-  SetTriggerValuesStage3 = 0xCD,
-  SetTriggerValuesStage4 = 0xD1,
-
-  SetTriggerConfigurationStage0 = 0xC2,
-  SetTriggerConfigurationStage1 = 0xC6,
-  SetTriggerConfigurationStage2 = 0xCA,
-  SetTriggerConfigurationStage3 = 0xCE,
-  SetTriggerConfigurationStage4 = 0xD2,
-
-  SetDivider = 0x80,
-  SetReadAndDelayCount = 0x81,
-  SetFlags = 0x82,
-};
-
-bool isShortCommand(uint8_t commandCode) {
-  switch (static_cast<CommandShort>(commandCode)) {
-  case CommandShort::Reset:
-  case CommandShort::Run:
-  case CommandShort::ID:
-  case CommandShort::GetMeatadata:
-  case CommandShort::XON:
-  case CommandShort::XOFF:
-    return true;
-  }
-  return false;
-}
-
-bool isLongCommand(uint8_t commandCode) {
-  switch (static_cast<CommandLong>(commandCode)) {
-  case CommandLong::SetDivider:
-  case CommandLong::SetReadAndDelayCount:
-  case CommandLong::SetFlags:
-  case CommandLong::SetTriggerMaskStage0:
-  case CommandLong::SetTriggerMaskStage1:
-  case CommandLong::SetTriggerMaskStage2:
-  case CommandLong::SetTriggerMaskStage3:
-  case CommandLong::SetTriggerMaskStage4:
-  case CommandLong::SetTriggerValuesStage0:
-  case CommandLong::SetTriggerValuesStage1:
-  case CommandLong::SetTriggerValuesStage2:
-  case CommandLong::SetTriggerValuesStage3:
-  case CommandLong::SetTriggerValuesStage4:
-  case CommandLong::SetTriggerConfigurationStage0:
-  case CommandLong::SetTriggerConfigurationStage1:
-  case CommandLong::SetTriggerConfigurationStage2:
-  case CommandLong::SetTriggerConfigurationStage3:
-  case CommandLong::SetTriggerConfigurationStage4:
-    return true;
-  }
-  return false;
-}
+uint8_t *volatile usbBuf = nullptr;
+volatile uint32_t usbBufLen = 0;
 
 auto idLine = std::to_array<std::uint8_t>({'1', 'A', 'L', 'S'});
 
@@ -126,6 +60,7 @@ auto metadata = std::to_array<std::uint8_t>(
      0x00});
 
 void onShortCommand(CommandShort command) {
+  blog("Short command: 0x%02hhX", static_cast<uint8_t>(command));
   switch (command) {
   case CommandShort::ID:
     blog("Send ID \"1ALS\"");
@@ -136,14 +71,14 @@ void onShortCommand(CommandShort command) {
     CDC_Transmit_FS(metadata.data(), metadata.size());
     break;
   case CommandShort::Reset:
-    run = false;
+    state = IDLE;
     break;
   case CommandShort::Run:
-    run = true;
+    state = WAIT_TRIGGER;
     break;
   case CommandShort::XON:
   case CommandShort::XOFF:
-    blog("Short command: 0x%02hhX", static_cast<uint8_t>(command));
+    blog("XON/XOFF not supported (ignored, I dont know what is it)");
     break;
   }
 }
@@ -169,11 +104,13 @@ void onLongCommand(CommandLong command, uint32_t arg) {
     blog("Triggers not supported (ignored)");
     break;
   case CommandLong::SetDivider:
+    // Sigrok игнорирует анонсированную частоту и всегда передает делитель для
+    // 100МГц, поэтому делитель пересчитывается для основной частоты - 84МГц
+    setDivider((arg + 1) * 84 / 100);
     break;
   case CommandLong::SetReadAndDelayCount:
-    readCount = ((arg & 0xFFFF) + 1) << 2;
-    delayCount = ((arg >> 16 & 0xFFFF) + 1) << 2;
-    blog("Set delay: %u read: %u", delayCount, readCount);
+    setRead(((arg & 0xFFFF) + 1) << 2);
+    setDelay(((arg >> 16 & 0xFFFF) + 1) << 2);
     break;
   case CommandLong::SetFlags:
     blog("Flags not supported (ignored)");
@@ -230,9 +167,6 @@ void blinkSignal(int times) {
   HAL_Delay(300);
 }
 
-uint8_t *volatile usbBuf = nullptr;
-volatile uint32_t usbBufLen = 0;
-
 void initMeasuring() {
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   CLEAR_BIT(TIM3->CR1, TIM_CR1_CEN);
@@ -252,20 +186,36 @@ void stopMeasuring() { CLEAR_BIT(TIM1->CR1, TIM_CR1_CEN); }
 void trigger() { SET_BIT(TIM3->CR1, TIM_CR1_CEN); }
 
 void setDelay(uint32_t samples) {
+  blog("Set delay: %u samples", samples);
   samples /= DELAY_PRESCALER + 1;
   TIM3->ARR = samples;
   TIM3->CCR1 = samples;
 }
 
-void serDivider(uint32_t divider) {
-  // Sigrok игнорирует анонсированную частоту и всегда передает делитель для
-  // 100МГц
-  auto effectiveDevider = (divider + 1) * 84 / 100;
-  if (effectiveDevider < 0xFFFF) {
+void setRead(uint32_t samples) {
+  blog("Set read: %u samples", samples);
+  readCount = samples;
+}
+
+void setDivider(uint32_t divider) {
+  auto sqrt = [](uint32_t x) {
+    uint32_t root = 1;
+    while (root * root < x)
+      root++;
+    return root;
+  };
+
+  if (divider <= 0x10000) {
     TIM1->PSC = 0;
-    TIM1->ARR = effectiveDevider - 1;
+    TIM1->ARR = divider - 1;
   } else {
+    auto part = sqrt(divider) - 1;
+    TIM1->PSC = part;
+    TIM1->ARR = part;
   }
+
+  blog("Set divider: %u (prescaller: %hu, arr: %hu)", divider,
+       (uint16_t)TIM1->PSC, (uint16_t)TIM1->ARR);
 }
 
 uint32_t lastSampleIndex() {
@@ -275,30 +225,28 @@ uint32_t lastSampleIndex() {
 extern "C" int cpp_main() {
   blog("Startup");
 
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+
   initMeasuring();
-  setDelay(4);
+  setDelay(16);
+  setDivider(499);
   trigger();
   startMeasuring();
 
   blinkSignal(2);
 
-  blog("DMA Status: %hhX", (uint8_t)HAL_DMA_GetState(&hdma_tim1_up));
-
-  blog("Initial GPIO state: 0x%08X", GPIOB->IDR);
-  for (int i = 0; i < 6; i++) {
-    blog("Sample[%hhu] = 0x%02hhX", (uint8_t)i, samples[i]);
-  }
-
   while (true) {
-    if (run) {
-      blog("Reporting... Count: %u", readCount);
-      for (uint32_t i = 0; i < readCount; i += sizeof(samples)) {
-        while (CDC_Transmit_FS(samples, sizeof(samples)) == USBD_BUSY)
-          ;
-      }
-      blog("Reported!");
-      run = false;
+    switch (state) {
+    case IDLE:
+      break;
+    case WAIT_TRIGGER:
+      break;
+    case MEASURING:
+      break;
+    case REPORTING:
+      break;
     }
+
     if (usbBuf) {
       auto buf = usbBuf;
       auto len = usbBufLen;
@@ -315,4 +263,10 @@ extern "C" int cpp_main() {
 extern "C" void USB_CDC_RxHandler(uint8_t *Buf, uint32_t Len) {
   usbBuf = Buf;
   usbBufLen = Len;
+}
+
+extern "C" void USB_CDC_TxCompleteHandler(uint8_t *Buf, uint32_t Len,
+                                          uint8_t epnum) {
+  if (state == REPORTING)
+    state = IDLE;
 }

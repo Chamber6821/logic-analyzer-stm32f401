@@ -59,7 +59,7 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define DELAY_PRESCALER 1
+#define DELAY_PRESCALER 3
 #define LED_Pin GPIO_PIN_13
 #define LED_GPIO_Port GPIOC
 #define KEY_Pin GPIO_PIN_0

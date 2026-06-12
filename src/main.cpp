@@ -7,6 +7,10 @@
 #include "usbd_cdc_if.h"
 #include "usbd_def.h"
 
+#define METADATA_NUMBER(UINT32)                                                \
+  ((UINT32) >> 24) & 0xFF, ((UINT32) >> 16) & 0xFF, ((UINT32) >> 8) & 0xFF,    \
+      ((UINT32) >> 0) & 0xFF
+
 extern USBD_HandleTypeDef hUsbDeviceFS;
 extern TIM_HandleTypeDef htim2;
 
@@ -90,61 +94,25 @@ bool isLongCommand(uint8_t commandCode) {
 
 auto idLine = std::to_array<std::uint8_t>({'1', 'A', 'L', 'S'});
 
-auto metadata = std::to_array<std::uint8_t>({
-    // 1. Name
-    0x01,
-    'S',
-    'T',
-    'M',
-    '3',
-    '2',
-    ' ',
-    'L',
-    'A',
-    ' ',
-    'C',
-    'a',
-    'm',
-    'b',
-    'e',
-    'r',
-    '6',
-    '8',
-    '2',
-    '1',
-    0x00,
+auto metadata = std::to_array<std::uint8_t>(
+    {// 1. Name
+     0x01, 'S', 'T', 'M', '3', '2', ' ', 'L', 'A', ' ', 'C', 'a', 'm', 'b', 'e',
+     'r', '6', '8', '2', '1', 0x00,
 
-    // 2. Channels: 8 (0x00000008)
-    0x20,
-    0x00,
-    0x00,
-    0x00,
-    0x08,
+     // 2. Channels: 8 (0x00000008)
+     0x20, METADATA_NUMBER(8),
 
-    // 3. Sample memory: 55 * 1024 = 56320 (0x0000DC00)
-    0x21,
-    0x00,
-    0x00,
-    0xDC,
-    0x00,
+     // 3. Sample memory (bytes)
+     0x21, METADATA_NUMBER(sizeof(samples)),
 
-    // 4. Max sample rate: 42 000 000 = 0x0280DE80
-    0x23,
-    0x02,
-    0x80,
-    0xDE,
-    0x80,
+     // 4. Max sample rate (Hz)
+     0x23, METADATA_NUMBER(42'000'000),
 
-    // 5. SUMP protocol version: 2 (0x00000002)
-    0x24,
-    0x00,
-    0x00,
-    0x00,
-    0x02,
+     // 5. SUMP protocol version
+     0x24, METADATA_NUMBER(2),
 
-    // Терминатор метаданных
-    0x00,
-});
+     // Терминатор метаданных
+     0x00});
 
 void onShortCommand(CommandShort command) {
   switch (command) {
@@ -192,8 +160,8 @@ void onLongCommand(CommandLong command, uint32_t arg) {
   case CommandLong::SetDivider:
     break;
   case CommandLong::SetReadAndDelayCount:
-    readCount = (arg & 0xFFFF) << 2;
-    delayCount = (arg >> 16 & 0xFFFF) << 2;
+    readCount = ((arg & 0xFFFF) + 1) << 2;
+    delayCount = ((arg >> 16 & 0xFFFF) + 1) << 2;
     blog("Set delay: %u read: %u", delayCount, readCount);
     break;
   case CommandLong::SetFlags:
@@ -263,7 +231,7 @@ extern "C" int cpp_main() {
 
   while (true) {
     if (run) {
-      blog("Reporting...");
+      blog("Reporting... Count: %u", readCount);
       for (uint32_t i = 0; i < readCount; i += sizeof(samples)) {
         while (CDC_Transmit_FS(samples, sizeof(samples)) == USBD_BUSY)
           ;

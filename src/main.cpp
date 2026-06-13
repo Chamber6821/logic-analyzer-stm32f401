@@ -1,11 +1,15 @@
 #include "main.h"
+#include "RingQueue.hpp"
+#include "StateMachine.hpp"
 #include "commands.hpp"
 
 #include <blola/blola.hpp>
 #include <blola/directWrite_SEGGER_RTT.hpp>
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
+#include <utility>
 
 #include "stm32f401xc.h"
 #include "stm32f4xx.h"
@@ -25,13 +29,23 @@ extern TIM_HandleTypeDef htim2;
 extern TIM_HandleTypeDef htim3;
 extern DMA_HandleTypeDef hdma_tim1_up;
 
+enum class State : std::uint8_t { IDLE, RUNNING, REPORTING };
+enum class Input : std::uint8_t {
+  RESET,
+  RUN,
+  ALL_MEASURED,
+  REPORTED,
+};
+
 void setDelay(uint32_t samples);
 void setRead(uint32_t samples);
 void setDivider(uint32_t divider);
+void onShortCommand(CommandShort command);
+void onLongCommand(CommandLong command, uint32_t arg);
+State stateTransition(State state, Input input);
 
-volatile enum { IDLE, WAIT_TRIGGER, MEASURING, REPORTING } state = IDLE;
 uint32_t readCount = 0;
-uint8_t samples[1024] = {0x12, 0x34};
+uint8_t samples[55 * 1024] = {0x12, 0x34};
 uint32_t sampleClock = 84'000'000 / 5;
 
 uint8_t *volatile usbBuf = nullptr;
@@ -59,64 +73,12 @@ auto metadata = std::to_array<std::uint8_t>(
      // Терминатор метаданных
      0x00});
 
-void onShortCommand(CommandShort command) {
-  blog("Short command: 0x%02hhX", static_cast<uint8_t>(command));
-  switch (command) {
-  case CommandShort::ID:
-    blog("Send ID \"1ALS\"");
-    CDC_Transmit_FS(idLine.data(), idLine.size());
-    break;
-  case CommandShort::GetMeatadata:
-    blog("Send Metadata");
-    CDC_Transmit_FS(metadata.data(), metadata.size());
-    break;
-  case CommandShort::Reset:
-    state = IDLE;
-    break;
-  case CommandShort::Run:
-    state = WAIT_TRIGGER;
-    break;
-  case CommandShort::XON:
-  case CommandShort::XOFF:
-    blog("XON/XOFF not supported (ignored, I dont know what is it)");
-    break;
-  }
-}
-
-void onLongCommand(CommandLong command, uint32_t arg) {
-  blog("Long command: 0x%02hhX 0x%08X", static_cast<uint8_t>(command), arg);
-  switch (command) {
-  case CommandLong::SetTriggerMaskStage0:
-  case CommandLong::SetTriggerMaskStage1:
-  case CommandLong::SetTriggerMaskStage2:
-  case CommandLong::SetTriggerMaskStage3:
-  case CommandLong::SetTriggerMaskStage4:
-  case CommandLong::SetTriggerValuesStage0:
-  case CommandLong::SetTriggerValuesStage1:
-  case CommandLong::SetTriggerValuesStage2:
-  case CommandLong::SetTriggerValuesStage3:
-  case CommandLong::SetTriggerValuesStage4:
-  case CommandLong::SetTriggerConfigurationStage0:
-  case CommandLong::SetTriggerConfigurationStage1:
-  case CommandLong::SetTriggerConfigurationStage2:
-  case CommandLong::SetTriggerConfigurationStage3:
-  case CommandLong::SetTriggerConfigurationStage4:
-    blog("Triggers not supported (ignored)");
-    break;
-  case CommandLong::SetDivider:
-    // Sigrok игнорирует анонсированную частоту и всегда передает делитель для
-    // 100МГц, поэтому делитель пересчитывается для основной частоты - 84МГц
-    setDivider((arg + 1) * 84 / 100);
-    break;
-  case CommandLong::SetReadAndDelayCount:
-    setRead(((arg & 0xFFFF) + 1) << 2);
-    setDelay(((arg >> 16 & 0xFFFF) + 1) << 2);
-    break;
-  case CommandLong::SetFlags:
-    blog("Flags not supported (ignored)");
-    break;
-  }
-}
+StateMachine state{State::IDLE, RingQueue<Input, 16>{},
+                   [](auto state, auto input) {
+                     if (not input.has_value())
+                       return state;
+                     return stateTransition(state, input.value());
+                   }};
 
 class CommandReader {
   enum { COMMAND, BYTE1, BYTE2, BYTE3, BYTE4 } expectation = COMMAND;
@@ -155,7 +117,7 @@ public:
       break;
     }
   }
-} commandReader;
+};
 
 void blinkSignal(int times) {
   SET_BIT(LED_GPIO_Port->ODR, LED_Pin);
@@ -168,7 +130,7 @@ void blinkSignal(int times) {
 }
 
 void initMeasuring() {
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1);
   CLEAR_BIT(TIM3->CR1, TIM_CR1_CEN);
   HAL_DMA_Start(&hdma_tim1_up, (uint32_t)&(GPIOB->IDR), (uint32_t)samples,
                 sizeof(samples));
@@ -222,30 +184,150 @@ uint32_t lastSampleIndex() {
   return sizeof(samples) - __HAL_DMA_GET_COUNTER(&hdma_tim1_up);
 }
 
+void reverse(uint8_t *begin, uint8_t *end) {
+  end--;
+  while (begin < end) {
+    std::swap(*begin, *end);
+    begin++;
+    end--;
+  }
+}
+
+void onShortCommand(CommandShort command) {
+  blog("Short command: 0x%02hhX", static_cast<uint8_t>(command));
+  switch (command) {
+  case CommandShort::ID:
+    blog("Send ID \"1ALS\"");
+    CDC_Transmit_FS(idLine.data(), idLine.size());
+    break;
+  case CommandShort::GetMeatadata:
+    blog("Send Metadata");
+    CDC_Transmit_FS(metadata.data(), metadata.size());
+    break;
+  case CommandShort::Reset:
+    state.input(Input::RESET);
+    break;
+  case CommandShort::Run:
+    state.input(Input::RUN);
+    break;
+  case CommandShort::XON:
+  case CommandShort::XOFF:
+    blog("XON/XOFF not supported (ignored, I dont know what is it)");
+    break;
+  }
+}
+
+void onLongCommand(CommandLong command, uint32_t arg) {
+  blog("Long command: 0x%02hhX 0x%08X", static_cast<uint8_t>(command), arg);
+  switch (command) {
+  case CommandLong::SetTriggerMaskStage0:
+  case CommandLong::SetTriggerMaskStage1:
+  case CommandLong::SetTriggerMaskStage2:
+  case CommandLong::SetTriggerMaskStage3:
+  case CommandLong::SetTriggerMaskStage4:
+  case CommandLong::SetTriggerValuesStage0:
+  case CommandLong::SetTriggerValuesStage1:
+  case CommandLong::SetTriggerValuesStage2:
+  case CommandLong::SetTriggerValuesStage3:
+  case CommandLong::SetTriggerValuesStage4:
+  case CommandLong::SetTriggerConfigurationStage0:
+  case CommandLong::SetTriggerConfigurationStage1:
+  case CommandLong::SetTriggerConfigurationStage2:
+  case CommandLong::SetTriggerConfigurationStage3:
+  case CommandLong::SetTriggerConfigurationStage4:
+    blog("Triggers not supported (ignored)");
+    break;
+  case CommandLong::SetDivider:
+    // Sigrok игнорирует анонсированную частоту и всегда передает делитель для
+    // 100МГц, поэтому делитель пересчитывается для основной частоты - 84МГц
+    setDivider((arg + 1) * 84 / 100);
+    break;
+  case CommandLong::SetReadAndDelayCount:
+    setRead(((arg & 0xFFFF) + 1) << 2);
+    setDelay(((arg >> 16 & 0xFFFF) + 1) << 2);
+    break;
+  case CommandLong::SetFlags:
+    blog("Flags not supported (ignored)");
+    break;
+  }
+}
+
+struct NoEffect {
+  void operator()() const {}
+};
+
+template <class Func = NoEffect> struct Transition {
+  State state;
+  Input input;
+  State nextState;
+  Func effect;
+};
+
+template <class... Funcs> class TransitionTable {
+  std::tuple<Transition<Funcs>...> table;
+
+public:
+  TransitionTable(Transition<Funcs> &&...transactions)
+      : table(std::move(transactions)...) {}
+
+  constexpr auto dispatch(State state, Input input, State defaultState) const {
+    auto result = defaultState;
+    [&]<std::size_t... Is>(std::index_sequence<Is...>) {
+      (([&]() {
+         const auto &element = std::get<Is>(table);
+         if (element.state == state and element.input == input) {
+           result = element.nextState;
+           element.effect();
+           return true;
+         }
+         return false;
+       }()) ||
+       ...);
+    }(std::make_index_sequence<std::tuple_size_v<decltype(table)>>{});
+    return result;
+  }
+};
+
+State stateTransition(State state, Input input) {
+  static const TransitionTable table{
+      Transition{State::IDLE, Input::RUN, State::RUNNING,
+                 []() {
+                   blog("Measuring...");
+                   initMeasuring();
+                   trigger();
+                   startMeasuring();
+                 }},
+      Transition{State::RUNNING, Input::RESET, State::IDLE,
+                 []() {
+                   blog("Reset");
+                   stopMeasuring();
+                 }},
+      Transition{State::RUNNING, Input::ALL_MEASURED, State::REPORTING,
+                 []() {
+                   blog("Reversing buffer...");
+                   reverse(samples, samples + lastSampleIndex());
+                   reverse(samples + lastSampleIndex(),
+                           samples + sizeof(samples));
+                   blog("Reporting...");
+                   CDC_Transmit_FS(samples, readCount);
+                 }},
+      Transition{State::REPORTING, Input::REPORTED, State::IDLE,
+                 []() { blog("Reported!"); }},
+  };
+
+  return table.dispatch(state, input, state);
+}
+
 extern "C" int cpp_main() {
   blog("Startup");
 
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
-  initMeasuring();
-  setDelay(16);
-  setDivider(499);
-  trigger();
-  startMeasuring();
-
   blinkSignal(2);
 
+  CommandReader commandReader;
   while (true) {
-    switch (state) {
-    case IDLE:
-      break;
-    case WAIT_TRIGGER:
-      break;
-    case MEASURING:
-      break;
-    case REPORTING:
-      break;
-    }
+    state.update();
 
     if (usbBuf) {
       auto buf = usbBuf;
@@ -267,6 +349,14 @@ extern "C" void USB_CDC_RxHandler(uint8_t *Buf, uint32_t Len) {
 
 extern "C" void USB_CDC_TxCompleteHandler(uint8_t *Buf, uint32_t Len,
                                           uint8_t epnum) {
-  if (state == REPORTING)
-    state = IDLE;
+  state.input(Input::REPORTED);
+}
+
+extern "C" void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim) {
+  blog("Pulse finished");
+  if (htim->Instance == TIM3) {
+    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
+      state.input(Input::ALL_MEASURED);
+    }
+  }
 }

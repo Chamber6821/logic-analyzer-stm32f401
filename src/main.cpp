@@ -3,17 +3,21 @@
 #include "StateMachine.hpp"
 #include "commands.hpp"
 
+#include <algorithm>
 #include <blola/blola.hpp>
 #include <blola/directWrite_SEGGER_RTT.hpp>
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <utility>
 
 #include "stm32f401xc.h"
 #include "stm32f4xx.h"
+#include "stm32f4xx_hal.h"
 #include "stm32f4xx_hal_dma.h"
+#include "stm32f4xx_hal_gpio.h"
 #include "stm32f4xx_hal_tim.h"
 #include "usbd_cdc_if.h"
 #include "usbd_def.h"
@@ -37,9 +41,6 @@ enum class Input : std::uint8_t {
   REPORTED,
 };
 
-void setDelay(uint32_t samples);
-void setRead(uint32_t samples);
-void setDivider(uint32_t divider);
 void onShortCommand(CommandShort command);
 void onLongCommand(CommandLong command, uint32_t arg);
 State stateTransition(State state, Input input);
@@ -47,6 +48,7 @@ State stateTransition(State state, Input input);
 uint32_t readCount = 0;
 uint8_t samples[55 * 1024] = {0x12, 0x34};
 uint32_t sampleClock = 84'000'000 / 5;
+uint8_t triggerMask = 0;
 
 uint8_t *volatile usbBuf = nullptr;
 volatile uint32_t usbBufLen = 0;
@@ -129,23 +131,36 @@ void blinkSignal(int times) {
   HAL_Delay(300);
 }
 
-void initMeasuring() {
+void startMeasuring() {
   HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1);
   CLEAR_BIT(TIM3->CR1, TIM_CR1_CEN);
   HAL_DMA_Start(&hdma_tim1_up, (uint32_t)&(GPIOB->IDR), (uint32_t)samples,
                 sizeof(samples));
   SET_BIT(TIM1->DIER, TIM_DIER_UDE);
-}
-
-void startMeasuring() {
-  TIM1->CNT = 0;
-  TIM3->CNT = 0;
   SET_BIT(TIM1->CR1, TIM_CR1_CEN);
 }
 
-void stopMeasuring() { CLEAR_BIT(TIM1->CR1, TIM_CR1_CEN); }
+void capture() {
+  CLEAR_BIT(TIM3->CR1, TIM_CR1_CEN);
+  TIM3->CNT = 0;
+  SET_BIT(TIM1->CR1, TIM_CR1_CEN);
+  EXTI->PR = 0;
+  EXTI->IMR = triggerMask;
+}
+
+void continueMeasuring() {
+  CLEAR_BIT(TIM3->CR1, TIM_CR1_CEN);
+  TIM3->CNT = 0;
+  EXTI->IMR = 0;
+}
 
 void trigger() { SET_BIT(TIM3->CR1, TIM_CR1_CEN); }
+void setTriggerMask(uint8_t mask) { triggerMask = mask; }
+uint8_t getTriggerMask() { return triggerMask; }
+void setTriggerValue(uint8_t value) {
+  EXTI->FTSR = ~value;
+  EXTI->RTSR = value;
+}
 
 void setDelay(uint32_t samples) {
   blog("Set delay: %u samples", samples);
@@ -221,11 +236,15 @@ void onLongCommand(CommandLong command, uint32_t arg) {
   blog("Long command: 0x%02hhX 0x%08X", static_cast<uint8_t>(command), arg);
   switch (command) {
   case CommandLong::SetTriggerMaskStage0:
+    setTriggerMask(arg);
+    break;
+  case CommandLong::SetTriggerValuesStage0:
+    setTriggerValue(arg);
+    break;
   case CommandLong::SetTriggerMaskStage1:
   case CommandLong::SetTriggerMaskStage2:
   case CommandLong::SetTriggerMaskStage3:
   case CommandLong::SetTriggerMaskStage4:
-  case CommandLong::SetTriggerValuesStage0:
   case CommandLong::SetTriggerValuesStage1:
   case CommandLong::SetTriggerValuesStage2:
   case CommandLong::SetTriggerValuesStage3:
@@ -235,7 +254,7 @@ void onLongCommand(CommandLong command, uint32_t arg) {
   case CommandLong::SetTriggerConfigurationStage2:
   case CommandLong::SetTriggerConfigurationStage3:
   case CommandLong::SetTriggerConfigurationStage4:
-    blog("Triggers not supported (ignored)");
+    blog("Triggers partial supported (ignored)");
     break;
   case CommandLong::SetDivider:
     // Sigrok игнорирует анонсированную частоту и всегда передает делитель для
@@ -292,15 +311,18 @@ State stateTransition(State state, Input input) {
   static const TransitionTable table{
       Transition{State::IDLE, Input::RUN, State::RUNNING,
                  []() {
-                   blog("Measuring...");
-                   initMeasuring();
-                   trigger();
-                   startMeasuring();
+                   blog("Capturing...");
+                   capture();
+                   if (getTriggerMask() == 0) {
+                     trigger();
+                   } else {
+                     blog("Wait trigger");
+                   }
                  }},
       Transition{State::RUNNING, Input::RESET, State::IDLE,
                  []() {
                    blog("Reset");
-                   stopMeasuring();
+                   continueMeasuring();
                  }},
       Transition{State::RUNNING, Input::ALL_MEASURED, State::REPORTING,
                  []() {
@@ -312,7 +334,10 @@ State stateTransition(State state, Input input) {
                    CDC_Transmit_FS(samples, readCount);
                  }},
       Transition{State::REPORTING, Input::REPORTED, State::IDLE,
-                 []() { blog("Reported!"); }},
+                 []() {
+                   blog("Reported!");
+                   continueMeasuring();
+                 }},
   };
 
   return table.dispatch(state, input, state);
@@ -324,6 +349,8 @@ extern "C" int cpp_main() {
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
   blinkSignal(2);
+  setDivider(5);
+  startMeasuring();
 
   CommandReader commandReader;
   while (true) {
@@ -360,3 +387,5 @@ extern "C" void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim) {
     }
   }
 }
+
+extern "C" void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) { trigger(); }

@@ -11,15 +11,14 @@ The firmware adopt for Black Pill (STM32F401CCU6)
 - `PA1` - reference 100kHz PWM
 - 56k - samples buffer
 - 16.8MHz - max sample rate
-- support simple trigger for any channel (on rise or fall)
+- support simple trigger for any channels (on rise or fall)
 
 ## Requirements
 
 - Make
 - CMake
 - GCC (supports C++23)
-- SEGGER RTT
-- Blola
+- OpenOCD
 
 ## Commands
 

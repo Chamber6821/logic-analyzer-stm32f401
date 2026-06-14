@@ -31,13 +31,13 @@ include(FetchContent)
 
 FetchContent_Declare(
   blola
-  GIT_REPOSITORY "$ENV{HOME}/Projects/embedded/libs/blola"
-  GIT_TAG master
+  GIT_REPOSITORY https://github.com/Chamber6821/blola.git
+  GIT_TAG v0.0.2
 )
 FetchContent_Declare(
   RTT
-  GIT_REPOSITORY "$ENV{HOME}/Projects/embedded/libs/RTT"
-  GIT_TAG master
+  GIT_REPOSITORY https://github.com/Chamber6821/segger-rtt.git
+  GIT_TAG 8.56a
 )
 
 FetchContent_MakeAvailable(blola RTT)

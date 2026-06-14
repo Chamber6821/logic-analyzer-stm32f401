@@ -46,7 +46,7 @@ target_include_directories(RTT PUBLIC config)
 
 file(CREATE_LINK
   "${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json"
-  "compile_commands.json"
+  "${CMAKE_CURRENT_BINARY_DIR}/../compile_commands.json"
   SYMBOLIC)
 
 file(CREATE_LINK

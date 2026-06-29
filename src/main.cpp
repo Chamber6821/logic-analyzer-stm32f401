@@ -16,9 +16,9 @@
 #include "stm32f401xc.h"
 #include "stm32f4xx.h"
 #include "stm32f4xx_hal.h"
-#include "stm32f4xx_hal_dma.h"
 #include "stm32f4xx_hal_gpio.h"
-#include "stm32f4xx_hal_tim.h"
+#include "stm32f4xx_ll_dma.h"
+#include "stm32f4xx_ll_tim.h"
 #include "usbd_cdc_if.h"
 #include "usbd_def.h"
 
@@ -27,11 +27,6 @@
       (uint8_t)((UINT32) >> 8), (uint8_t)((UINT32) >> 0)
 
 extern USBD_HandleTypeDef hUsbDeviceFS;
-
-extern TIM_HandleTypeDef htim1;
-extern TIM_HandleTypeDef htim2;
-extern TIM_HandleTypeDef htim3;
-extern DMA_HandleTypeDef hdma_tim1_up;
 
 enum class State : std::uint8_t { IDLE, RUNNING, REPORTING };
 enum class Input : std::uint8_t {
@@ -49,15 +44,15 @@ constexpr uint32_t clockInMHz = 60;
 constexpr uint32_t sampleClockInHz = clockInMHz * 1'000'000 / 6;
 
 uint32_t readCount = 0;
-uint8_t samples[55 * 1024] = {0x12, 0x34};
+uint8_t samples[60382] = {};
 uint8_t triggerMask = 0;
 
 uint8_t *volatile usbBuf = nullptr;
-uint32_t volatile usbBufLen = 0;
+uint8_t volatile usbBufLen = 0;
 
-auto idLine = std::to_array<std::uint8_t>({'1', 'A', 'L', 'S'});
+const auto idLine = std::to_array<std::uint8_t>({'1', 'A', 'L', 'S'});
 
-auto metadata = std::to_array<std::uint8_t>(
+const auto metadata = std::to_array<std::uint8_t>(
     {// 1. Name
      0x01, 'S', 'T', 'M', '3', '2', ' ', 'L', 'A', ' ', 'C', 'a', 'm', 'b', 'e',
      'r', '6', '8', '2', '1', 0x00,
@@ -77,7 +72,7 @@ auto metadata = std::to_array<std::uint8_t>(
      // Терминатор метаданных
      0x00});
 
-StateMachine state{State::IDLE, RingQueue<Input, 16>{},
+StateMachine state{State::IDLE, RingQueue<Input, 4>{},
                    [](auto state, auto input) {
                      if (not input.has_value())
                        return state;
@@ -134,12 +129,30 @@ void blinkSignal(int times) {
 }
 
 void startMeasuring() {
-  HAL_TIM_PWM_Start_IT(&htim3, TIM_CHANNEL_1);
-  CLEAR_BIT(TIM3->CR1, TIM_CR1_CEN);
-  HAL_DMA_Start(&hdma_tim1_up, (uint32_t)&(GPIOB->IDR), (uint32_t)samples,
-                sizeof(samples));
-  SET_BIT(TIM1->DIER, TIM_DIER_UDE);
-  SET_BIT(TIM1->CR1, TIM_CR1_CEN);
+  LL_TIM_CC_EnableChannel(TIM3, LL_TIM_CHANNEL_CH1);
+  LL_TIM_EnableIT_CC1(TIM3);
+  LL_TIM_DisableCounter(TIM3);
+
+  // HAL_DMA_Start(&hdma_tim1_up, (uint32_t)&(GPIOB->IDR), (uint32_t)samples,
+  //               sizeof(samples));
+
+  LL_DMA_SetPeriphAddress(DMA2, LL_DMA_STREAM_5, (uint32_t)&GPIOB->IDR);
+  LL_DMA_SetMemoryAddress(DMA2, LL_DMA_STREAM_5, (uint32_t)samples);
+  LL_DMA_SetDataLength(DMA2, LL_DMA_STREAM_5, sizeof(samples));
+  LL_DMA_SetDataTransferDirection(DMA2, LL_DMA_STREAM_5,
+                                  LL_DMA_DIRECTION_PERIPH_TO_MEMORY);
+  LL_DMA_SetMemoryIncMode(DMA2, LL_DMA_STREAM_5, LL_DMA_MEMORY_INCREMENT);
+  LL_DMA_SetPeriphIncMode(DMA2, LL_DMA_STREAM_5, LL_DMA_PERIPH_NOINCREMENT);
+
+  LL_DMA_SetMemorySize(DMA2, LL_DMA_STREAM_5, LL_DMA_MDATAALIGN_BYTE);
+  LL_DMA_SetPeriphSize(DMA2, LL_DMA_STREAM_5, LL_DMA_PDATAALIGN_BYTE);
+
+  LL_DMA_SetMode(DMA2, LL_DMA_STREAM_5, LL_DMA_MODE_CIRCULAR);
+
+  LL_DMA_EnableStream(DMA2, LL_DMA_STREAM_5);
+
+  LL_TIM_EnableDMAReq_UPDATE(TIM1);
+  LL_TIM_EnableCounter(TIM1);
 }
 
 void capture() {
@@ -198,7 +211,7 @@ void setDivider(uint32_t divider) {
 }
 
 uint32_t lastSampleIndex() {
-  return sizeof(samples) - __HAL_DMA_GET_COUNTER(&hdma_tim1_up);
+  return sizeof(samples) - LL_DMA_GetDataLength(DMA2, LL_DMA_STREAM_5);
 }
 
 void reverse(uint8_t *begin, uint8_t *end) {
@@ -215,11 +228,11 @@ void onShortCommand(CommandShort command) {
   switch (command) {
   case CommandShort::ID:
     blog("Send ID \"1ALS\"");
-    CDC_Transmit_FS(idLine.data(), idLine.size());
+    CDC_Transmit_FS(const_cast<uint8_t *>(idLine.data()), idLine.size());
     break;
   case CommandShort::GetMeatadata:
     blog("Send Metadata");
-    CDC_Transmit_FS(metadata.data(), metadata.size());
+    CDC_Transmit_FS(const_cast<uint8_t *>(idLine.data()), metadata.size());
     break;
   case CommandShort::Reset:
     state.input(Input::RESET);
@@ -349,7 +362,8 @@ State stateTransition(State state, Input input) {
 extern "C" int cpp_main() {
   blog("Startup");
 
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  LL_TIM_CC_EnableChannel(TIM2, LL_TIM_CHANNEL_CH2);
+  LL_TIM_EnableCounter(TIM2);
 
   blinkSignal(2);
   setDivider(5);
@@ -382,12 +396,12 @@ extern "C" void USB_CDC_TxCompleteHandler(uint8_t *Buf, uint32_t Len,
   state.input(Input::REPORTED);
 }
 
-extern "C" void HAL_TIM_PWM_PulseFinishedCallback(TIM_HandleTypeDef *htim) {
-  blog("Pulse finished");
-  if (htim->Instance == TIM3) {
-    if (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1) {
-      state.input(Input::ALL_MEASURED);
-    }
+extern "C" void TIM3_IRQHandler(void) {
+  if (LL_TIM_IsActiveFlag_CC1(TIM3)) {
+    LL_TIM_ClearFlag_CC1(TIM3);
+
+    blog("Pulse finished");
+    state.input(Input::ALL_MEASURED);
   }
 }
 

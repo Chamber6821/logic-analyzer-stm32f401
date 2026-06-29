@@ -45,13 +45,15 @@ void onShortCommand(CommandShort command);
 void onLongCommand(CommandLong command, uint32_t arg);
 State stateTransition(State state, Input input);
 
+constexpr uint32_t clockInMHz = 60;
+constexpr uint32_t sampleClockInHz = clockInMHz * 1'000'000 / 6;
+
 uint32_t readCount = 0;
 uint8_t samples[55 * 1024] = {0x12, 0x34};
-uint32_t sampleClock = 84'000'000 / 5;
 uint8_t triggerMask = 0;
 
 uint8_t *volatile usbBuf = nullptr;
-volatile uint32_t usbBufLen = 0;
+uint32_t volatile usbBufLen = 0;
 
 auto idLine = std::to_array<std::uint8_t>({'1', 'A', 'L', 'S'});
 
@@ -67,7 +69,7 @@ auto metadata = std::to_array<std::uint8_t>(
      0x21, METADATA_NUMBER(sizeof(samples)),
 
      // 4. Max sample rate (Hz)
-     0x23, METADATA_NUMBER(sampleClock),
+     0x23, METADATA_NUMBER(sampleClockInHz),
 
      // 5. SUMP protocol version
      0x24, METADATA_NUMBER(2),
@@ -258,8 +260,9 @@ void onLongCommand(CommandLong command, uint32_t arg) {
     break;
   case CommandLong::SetDivider:
     // Sigrok игнорирует анонсированную частоту и всегда передает делитель для
-    // 100МГц, поэтому делитель пересчитывается для основной частоты - 84МГц
-    setDivider((arg + 1) * 84 / 100);
+    // 100МГц, поэтому делитель пересчитывается для основной частоты -
+    // clockInMHz
+    setDivider((arg + 1) * clockInMHz / 100);
     break;
   case CommandLong::SetReadAndDelayCount:
     setRead(((arg & 0xFFFF) + 1) << 2);

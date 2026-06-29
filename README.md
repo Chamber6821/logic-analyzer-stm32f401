@@ -9,9 +9,9 @@ The firmware adopt for Black Pill (STM32F401CCU6)
 
 - `PB0-PB7` - channels 0-7
 - `PA1` - reference 100kHz PWM
-- 56k - samples buffer
+- 60382 - samples buffer
 - 10MHz - max sample rate in PulseView
-- 16.8MHz - max possible sample rate
+- 15MHz - max possible sample rate
 - support simple trigger for any channels (on rise or fall)
 
 ## Requirements
